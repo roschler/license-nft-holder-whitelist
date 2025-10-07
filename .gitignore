@@ -1,0 +1,57 @@
+# Compiler files
+cache/
+out/
+artifacts/
+forge-cache/
+
+package-lock.json
+
+# Ignores development broadcast logs
+# !/broadcast
+deployments
+broadcast
+!/broadcast/*/1/
+
+# Dotenv file
+.env
+
+.idea/
+node_modules/
+
+.vscode
+.DS_Store
+pnpm-lock.yaml
+
+coverage
+
+# contracts
+abi
+typechain
+!./script/out
+
+# converage
+lcov.info
+
+*.DS_Store
+npm-debug.log
+log
+.nyc_output
+
+# No user data files.
+../../../data/user-data/
+
+# No SSL certificate files.
+*.pem
+
+# No bookmarks data
+nextgen/data/bookmark-source-text-files
+
+# Ignore Mythril analysis reports
+/reports/
+/reports/*
+!/reports/.gitkeep
+
+# Slither analysis outputs
+/slither-reports/
+/slither-reports/*
+!/slither-reports/.gitkeep

@@ -1,0 +1,26 @@
+No files changed, compilation skipped
+
+Ran 20 tests for test/LicenseNftHolderWhitelistHookTest.t.sol:LicenseNftHolderWhitelistHookTest
+[PASS] test_addWhitelistNft_success() (gas: 269761)
+[PASS] test_afterRemovingLastWhitelist_mintReverts() (gas: 402397)
+[PASS] test_beforeMintLicenseTokens_anyOfMultipleWhitelistedCollectionsIsEnough() (gas: 553278)
+[PASS] test_beforeMintLicenseTokens_multipleAmount_feeMultiplies() (gas: 382177)
+[PASS] test_beforeMintLicenseTokens_success_whenCallerHoldsWhitelistedNft() (gas: 384305)
+[PASS] test_beforeMintLicenseTokens_worksWhenReceiverDiffersFromCaller() (gas: 382304)
+[PASS] test_beforeRegisterDerivative_success_whenCallerHoldsWhitelistedNft() (gas: 382130)
+[PASS] test_calculateMintingFee_matches_beforeMint_fee() (gas: 59688)
+[PASS] test_isNftWhitelisted_falseByDefault() (gas: 38900)
+[PASS] test_removeMaintainsCompactList_swapAndPop() (gas: 478157)
+[PASS] test_removeWhitelistNft_success() (gas: 285977)
+[PASS] test_revert_addWhitelistNft_whenAlreadyWhitelisted() (gas: 352684)
+[PASS] test_revert_addWhitelistNft_whenLicenseNotAttached() (gas: 370993)
+[PASS] test_revert_addWhitelistNft_whenNoPermission() (gas: 158665)
+[PASS] test_revert_addWhitelistNft_zeroAddress() (gas: 158052)
+[PASS] test_revert_beforeMintLicenseTokens_whenCallerDoesNotHoldAnyWhitelistedNft() (gas: 269786)
+[PASS] test_revert_beforeRegisterDerivative_whenCallerDoesNotHoldWhitelistedNft() (gas: 269745)
+[PASS] test_revert_removeWhitelistNft_whenNoPermission() (gas: 363866)
+[PASS] test_revert_removeWhitelistNft_whenNotWhitelisted() (gas: 152726)
+[PASS] test_whitelistIsolation_acrossDifferentLicenseTerms() (gas: 1003845)
+Suite result: ok. 20 passed; 0 failed; 0 skipped; finished in 12.94s (2.32s CPU time)
+
+Ran 1 test suite in 13.44s (12.94s CPU time): 20 tests passed, 0 failed, 0 skipped (20 total tests)

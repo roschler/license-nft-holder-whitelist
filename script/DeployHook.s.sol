@@ -3,7 +3,7 @@ pragma solidity ^0.8.26;
 
 import {Script} from "forge-std/Script.sol";
 import {console2} from "forge-std/console2.sol";
-import {LicenseNftHolderWhitelistHook} from "contracts/LicenseNftHolderWhitelistHook.sol";
+import {LicenseNftHolderWhitelistHook} from "../contracts/LicenseNftHolderWhitelistHook.sol";
 
 /// @title DeployHook
 /// @notice Foundry script to deploy OwnershipGatedLicenseHook with an empty whitelist.

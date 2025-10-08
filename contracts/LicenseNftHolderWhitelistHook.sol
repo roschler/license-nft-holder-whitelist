@@ -10,77 +10,76 @@ import { ILicenseTemplate } from "@storyprotocol/core/interfaces/modules/licensi
 import { IIPAccount } from "@storyprotocol/core/interfaces/IIPAccount.sol";
 import { ILicenseRegistry } from "@storyprotocol/core/interfaces/registries/ILicenseRegistry.sol";
 
+import {
+    LicenseNftHolderWhitelistHook_ZeroAddress,
+    LicenseNftHolderWhitelistHook_NotAttached,
+    LicenseNftHolderWhitelistHook_InvalidHookData,
+    LicenseNftHolderWhitelistHook_AlreadyWhitelisted,
+    LicenseNftHolderWhitelistHook_NotWhitelisted,
+    LicenseNftHolderWhitelistHook_NotContract,
+    LicenseNftHolderWhitelistHook_NotERC721,
+    LicenseNftHolderWhitelistHook_CallerNotHolder
+} from "../errors/LicenseNftHolderWhitelistHookErrors.sol";
+
 /**
- * @title NFT Holder Gating Hook
- * @notice Gates license minting by requiring the caller to currently own at least
- *         one ERC-721 token from ANY NFT contract whitelisted for the given license.
+ * @title NFT Holder Gating Hook (flattened whitelist, log-enriched)
+ * @notice Gates license minting by requiring the caller to own at least one token from an
+ *         ERC-721 contract that has been whitelisted for the scoped license.
  *
- *         Scoping of the whitelist mirrors the official sample:
- *         key = keccak256(ipOwner, licensorIpId, licenseTemplate, licenseTermsId).
+ *         Scope factors: current IP owner, licensor IP ID, license template, license terms ID.
+ *         Membership key: keccak256(scopeKey, nftContract).
  *
- *         To use this hook, set the `licensingHook` field in the licensing config
- *         to the deployed address of this contract.
- *
- * @dev This hook checks the CALLER's NFT holdings (not the receiver's).
- *      If you need to gate by receiver, adapt `_checkNftHolderWhitelist` to
- *      use `receiver` instead of `caller`.
+ *         Caller MUST supply the candidate NFT contract via `hookData`:
+ *           hookData = abi.encode(address nftContract)
  */
 contract LicenseNftHolderWhitelistHook is BaseModule, AccessControlled, ILicensingHook {
-    /// @dev Human-readable module name.
     string public constant override name = "LICENSE_NFT_HOLDER_WHITELIST_HOOK";
 
-    /// @dev Story Protocol LicenseRegistry for "license attached" validation.
     ILicenseRegistry public immutable LICENSE_REGISTRY;
 
-    /**
-     * @notice For each scoped license key, track NFT contracts that are allowed.
-     *         `whitelistedNfts[key][nftContract] == true` means the contract is allowed.
-     */
-    mapping(bytes32 => mapping(address => bool)) private whitelistedNfts;
+    /// @dev Flattened whitelist: (scope + nftContract) => allowed
+    mapping(bytes32 => bool) private _whitelisted;
+
+    /* ─────────────────────────────
+       Events / Errors
+       ───────────────────────────── */
 
     /**
-     * @notice Optional enumerable storage (per key) to iterate whitelisted contracts.
-     *         Useful for offchain tooling and `view` helpers.
+     * @notice Emitted when an NFT contract is whitelisted for a scope.
+     * @param scopeKey          keccak256(ipOwner, licensorIpId, licenseTemplate, licenseTermsId) at emit time
+     * @param licensorIpId      licensor IP id
+     * @param licenseTemplate   license template address
+     * @param licenseTermsId    license terms id
+     * @param nftContract       ERC-721 contract address added
+     * @param ipOwnerAtWrite    owner of the licensor IP at emit time
      */
-    mapping(bytes32 => address[]) private whitelistedNftList;
-
-    /**
-     * @notice Keep an index for O(1) removal from the list (swap & pop).
-     *         1-based indexing so 0 means "absent".
-     */
-    mapping(bytes32 => mapping(address => uint256)) private nftIndex1Based;
-
-    /* *************************
-     *           Events
-     * *************************/
     event NftContractWhitelisted(
-        address indexed licensorIpId,
-        address indexed licenseTemplate,
-        uint256 indexed licenseTermsId,
-        address nftContract
+        bytes32 indexed scopeKey,
+        address licensorIpId,
+        address licenseTemplate,
+        uint256 licenseTermsId,
+        address nftContract,
+        address ipOwnerAtWrite
     );
 
+    /**
+     * @notice Emitted when an NFT contract is removed from a scope whitelist.
+     * @param scopeKey          keccak256(ipOwner, licensorIpId, licenseTemplate, licenseTermsId) at emit time
+     * @param licensorIpId      licensor IP id
+     * @param licenseTemplate   license template address
+     * @param licenseTermsId    license terms id
+     * @param nftContract       ERC-721 contract address removed
+     * @param ipOwnerAtWrite    owner of the licensor IP at emit time
+     */
     event NftContractRemovedFromWhitelist(
-        address indexed licensorIpId,
-        address indexed licenseTemplate,
-        uint256 indexed licenseTermsId,
-        address nftContract
+        bytes32 indexed scopeKey,
+        address licensorIpId,
+        address licenseTemplate,
+        uint256 licenseTermsId,
+        address nftContract,
+        address ipOwnerAtWrite
     );
 
-    /* *************************
-     *          Errors
-     * *************************/
-    error LicenseNftHolderWhitelistHook_ZeroAddress();
-    error LicenseNftHolderWhitelistHook_NotAttached();
-    error LicenseNftHolderWhitelistHook_AlreadyWhitelisted(address nftContract);
-    error LicenseNftHolderWhitelistHook_NotWhitelisted(address nftContract);
-    error LicenseNftHolderWhitelistHook_CallerNotHolder(address caller);
-    error LicenseNftHolderWhitelistHook_NotContract(address nftContract);
-    error LicenseNftHolderWhitelistHook_NotERC721(address nftContract);
-    
-    /* *************************
-     *        Construction
-     * *************************/
     constructor(
         address accessController,
         address ipAssetRegistry,
@@ -92,31 +91,13 @@ contract LicenseNftHolderWhitelistHook is BaseModule, AccessControlled, ILicensi
         LICENSE_REGISTRY = ILicenseRegistry(licenseRegistry);
     }
 
-    /// @dev Validate that `nftContract` is a deployed contract that reports ERC-721 support via ERC-165.
-    function _assertErc721Contract(address nftContract) internal view {
-        // must be a contract
-        if (nftContract.code.length == 0) {
-            revert LicenseNftHolderWhitelistHook_NotContract(nftContract);
-        }
-
-        // ERC-165 supportsInterface(ERC721)
-        bytes4 iid = type(IERC721).interfaceId;
-        (bool ok, bytes memory ret) =
-                            nftContract.staticcall(abi.encodeWithSelector(IERC165.supportsInterface.selector, iid));
-
-        bool isSupported = ok && ret.length >= 32 && abi.decode(ret, (bool));
-        if (!isSupported) {
-            revert LicenseNftHolderWhitelistHook_NotERC721(nftContract);
-        }
-    }
-
-    /* *************************
-     *     Admin: whitelist mgmt
-     * *************************/
+    /* ─────────────────────────────
+       Admin: whitelist management
+       ───────────────────────────── */
 
     /**
-     * @notice Add an NFT contract to the whitelist for a specific license scope.
-     * @dev Only an address with permission over `licensorIpId` may call.
+     * @notice Add an ERC-721 contract to the whitelist for the scoped license.
+     * @dev Only addresses with permission over `licensorIpId` may call.
      */
     function addWhitelistNft(
         address licensorIpId,
@@ -133,30 +114,35 @@ contract LicenseNftHolderWhitelistHook is BaseModule, AccessControlled, ILicensi
         ) {
             revert LicenseNftHolderWhitelistHook_NotAttached();
         }
-
         if (nftContract == address(0)) {
             revert LicenseNftHolderWhitelistHook_ZeroAddress();
         }
 
-        // NEW: validate target is an ERC-721 contract (ERC-165 probe)
         _assertErc721Contract(nftContract);
 
-        bytes32 key = _scopeKey(licensorIpId, licenseTemplate, licenseTermsId);
+        address ipOwnerAtWrite = IIPAccount(payable(licensorIpId)).owner();
+        bytes32 scopeKey = keccak256(abi.encodePacked(ipOwnerAtWrite, licensorIpId, licenseTemplate, licenseTermsId));
+        bytes32 memberKey = keccak256(abi.encodePacked(scopeKey, nftContract));
 
-        if (whitelistedNfts[key][nftContract]) {
+        if (_whitelisted[memberKey]) {
             revert LicenseNftHolderWhitelistHook_AlreadyWhitelisted(nftContract);
         }
 
-        whitelistedNfts[key][nftContract] = true;
-        whitelistedNftList[key].push(nftContract);
-        nftIndex1Based[key][nftContract] = whitelistedNftList[key].length; // 1-based
+        _whitelisted[memberKey] = true;
 
-        emit NftContractWhitelisted(licensorIpId, licenseTemplate, licenseTermsId, nftContract);
+        emit NftContractWhitelisted(
+            scopeKey,
+            licensorIpId,
+            licenseTemplate,
+            licenseTermsId,
+            nftContract,
+            ipOwnerAtWrite
+        );
     }
 
     /**
-     * @notice Remove an NFT contract from the whitelist for a specific license scope.
-     * @dev Only an address with permission over `licensorIpId` may call.
+     * @notice Remove an ERC-721 contract from the whitelist for the scoped license.
+     * @dev Only addresses with permission over `licensorIpId` may call.
      */
     function removeWhitelistNft(
         address licensorIpId,
@@ -164,36 +150,28 @@ contract LicenseNftHolderWhitelistHook is BaseModule, AccessControlled, ILicensi
         uint256 licenseTermsId,
         address nftContract
     ) external verifyPermission(licensorIpId) {
-        bytes32 key = _scopeKey(licensorIpId, licenseTemplate, licenseTermsId);
+        address ipOwnerAtWrite = IIPAccount(payable(licensorIpId)).owner();
+        bytes32 scopeKey = keccak256(abi.encodePacked(ipOwnerAtWrite, licensorIpId, licenseTemplate, licenseTermsId));
+        bytes32 memberKey = keccak256(abi.encodePacked(scopeKey, nftContract));
 
-        if (!whitelistedNfts[key][nftContract]) {
+        if (!_whitelisted[memberKey]) {
             revert LicenseNftHolderWhitelistHook_NotWhitelisted(nftContract);
         }
 
-        // delete mapping flag
-        whitelistedNfts[key][nftContract] = false;
+        _whitelisted[memberKey] = false;
 
-        // swap & pop from the list using the index map
-        uint256 idx1 = nftIndex1Based[key][nftContract];
-        uint256 last = whitelistedNftList[key].length;
-
-        if (idx1 != last) {
-            address lastAddr = whitelistedNftList[key][last - 1];
-            whitelistedNftList[key][idx1 - 1] = lastAddr;
-            nftIndex1Based[key][lastAddr] = idx1;
-        }
-        whitelistedNftList[key].pop();
-        nftIndex1Based[key][nftContract] = 0;
-
-        emit NftContractRemovedFromWhitelist(licensorIpId, licenseTemplate, licenseTermsId, nftContract);
+        emit NftContractRemovedFromWhitelist(
+            scopeKey,
+            licensorIpId,
+            licenseTemplate,
+            licenseTermsId,
+            nftContract,
+            ipOwnerAtWrite
+        );
     }
 
-    /* *************************
-     *         View helpers
-     * *************************/
-
     /**
-     * @notice Check if an NFT contract is whitelisted for a given scope.
+     * @notice Check whitelist membership for a specific (scope, nftContract).
      */
     function isNftWhitelisted(
         address licensorIpId,
@@ -201,26 +179,15 @@ contract LicenseNftHolderWhitelistHook is BaseModule, AccessControlled, ILicensi
         uint256 licenseTermsId,
         address nftContract
     ) external view returns (bool) {
-        bytes32 key = _scopeKey(licensorIpId, licenseTemplate, licenseTermsId);
-        return whitelistedNfts[key][nftContract];
+        address ipOwner = IIPAccount(payable(licensorIpId)).owner();
+        bytes32 scopeKey = keccak256(abi.encodePacked(ipOwner, licensorIpId, licenseTemplate, licenseTermsId));
+        bytes32 memberKey = keccak256(abi.encodePacked(scopeKey, nftContract));
+        return _whitelisted[memberKey];
     }
 
-    /**
-     * @notice Return the full list of whitelisted NFT contracts for a given scope.
-     * @dev For offchain consumption; onchain callers should avoid large unbounded arrays.
-     */
-    function listWhitelistedNfts(
-        address licensorIpId,
-        address licenseTemplate,
-        uint256 licenseTermsId
-    ) external view returns (address[] memory) {
-        bytes32 key = _scopeKey(licensorIpId, licenseTemplate, licenseTermsId);
-        return whitelistedNftList[key];
-    }
-
-    /* *************************
-     *     Licensing hook logic
-     * *************************/
+    /* ─────────────────────────────
+       Licensing hook logic
+       ───────────────────────────── */
 
     function beforeMintLicenseTokens(
         address caller,
@@ -229,9 +196,10 @@ contract LicenseNftHolderWhitelistHook is BaseModule, AccessControlled, ILicensi
         uint256 licenseTermsId,
         uint256 amount,
         address /* receiver */,
-        bytes calldata /* hookData */
+        bytes calldata hookData
     ) external returns (uint256 totalMintingFee) {
-        _checkNftHolderWhitelist(licensorIpId, licenseTemplate, licenseTermsId, caller);
+        address nft = _decodeHookDataNft(hookData);
+        _checkNftHolderWhitelist(licensorIpId, licenseTemplate, licenseTermsId, caller, nft);
         return _calculateFee(licenseTemplate, licenseTermsId, amount);
     }
 
@@ -241,9 +209,10 @@ contract LicenseNftHolderWhitelistHook is BaseModule, AccessControlled, ILicensi
         address parentIpId,
         address licenseTemplate,
         uint256 licenseTermsId,
-        bytes calldata /* hookData */
+        bytes calldata hookData
     ) external returns (uint256 mintingFee) {
-        _checkNftHolderWhitelist(parentIpId, licenseTemplate, licenseTermsId, caller);
+        address nft = _decodeHookDataNft(hookData);
+        _checkNftHolderWhitelist(parentIpId, licenseTemplate, licenseTermsId, caller, nft);
         return _calculateFee(licenseTemplate, licenseTermsId, 1);
     }
 
@@ -269,53 +238,59 @@ contract LicenseNftHolderWhitelistHook is BaseModule, AccessControlled, ILicensi
         return interfaceId == type(ILicensingHook).interfaceId || super.supportsInterface(interfaceId);
     }
 
-    /* *************************
-     *        Internal utils
-     * *************************/
+    /* ─────────────────────────────
+       Internal utils
+       ───────────────────────────── */
 
-    /// @dev Build the scoping key using current IP owner so ownership change resets scope.
-    function _scopeKey(
-        address licensorIpId,
-        address licenseTemplate,
-        uint256 licenseTermsId
-    ) internal view returns (bytes32) {
-        address ipOwner = IIPAccount(payable(licensorIpId)).owner();
-        return keccak256(abi.encodePacked(ipOwner, licensorIpId, licenseTemplate, licenseTermsId));
-    }
-
-    /// @dev Revert unless `account` owns at least one token from any whitelisted ERC-721 in scope.
+    /// @dev Require that `account` owns at least one token from `nft` and that `nft` is whitelisted for the scope.
     function _checkNftHolderWhitelist(
         address licensorIpId,
         address licenseTemplate,
         uint256 licenseTermsId,
-        address account
+        address account,
+        address nft
     ) internal view {
-        bytes32 key = _scopeKey(licensorIpId, licenseTemplate, licenseTermsId);
+        address ipOwner = IIPAccount(payable(licensorIpId)).owner();
+        bytes32 scopeKey = keccak256(abi.encodePacked(ipOwner, licensorIpId, licenseTemplate, licenseTermsId));
+        bytes32 memberKey = keccak256(abi.encodePacked(scopeKey, nft));
 
-        address[] memory list = whitelistedNftList[key];
-        uint256 len = list.length;
-
-        bool eligible = false;
-
-        // Require at least one NFT contract to be whitelisted and held by caller.
-        for (uint256 i = 0; i < len; i++) {
-            address nft = list[i];
-            if (whitelistedNfts[key][nft]) {
-                // Try-catch not needed for standard ERC-721; if the target doesn't implement,
-                // this will revert, which is acceptable (treat as not eligible).
-                if (IERC721(nft).balanceOf(account) > 0) {
-                    eligible = true;
-                    break;
-                }
-            }
+        if (!_whitelisted[memberKey]) {
+            revert LicenseNftHolderWhitelistHook_NotWhitelisted(nft);
         }
 
-        if (!eligible) {
+        if (IERC721(nft).balanceOf(account) == 0) {
             revert LicenseNftHolderWhitelistHook_CallerNotHolder(account);
         }
     }
 
-    /// @dev Mirror of the sample: pull minting fee from the license template.
+    /// @dev Validate target contract is an ERC-721 (ERC-165 probe).
+    function _assertErc721Contract(address nftContract) internal view {
+        if (nftContract.code.length == 0) {
+            revert LicenseNftHolderWhitelistHook_NotContract(nftContract);
+        }
+
+        bytes4 iid = type(IERC721).interfaceId;
+        (bool ok, bytes memory ret) =
+                            nftContract.staticcall(abi.encodeWithSelector(IERC165.supportsInterface.selector, iid));
+
+        bool isSupported = ok && ret.length >= 32 && abi.decode(ret, (bool));
+        if (!isSupported) {
+            revert LicenseNftHolderWhitelistHook_NotERC721(nftContract);
+        }
+    }
+
+    /// @dev Decode hookData as abi.encode(address nftContract).
+    function _decodeHookDataNft(bytes calldata hookData) internal pure returns (address nft) {
+        if (hookData.length != 32) {
+            revert LicenseNftHolderWhitelistHook_InvalidHookData();
+        }
+        nft = abi.decode(hookData, (address));
+        if (nft == address(0)) {
+            revert LicenseNftHolderWhitelistHook_InvalidHookData();
+        }
+    }
+
+    /// @dev Pull fee data from the license template.
     function _calculateFee(
         address licenseTemplate,
         uint256 licenseTermsId,

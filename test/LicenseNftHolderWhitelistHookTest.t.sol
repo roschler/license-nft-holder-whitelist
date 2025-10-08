@@ -11,18 +11,31 @@ import { ModuleRegistry } from "@storyprotocol/core/registries/ModuleRegistry.so
 import { MockERC20 } from "@storyprotocol/test/mocks/token/MockERC20.sol";
 import { MockERC721 } from "@storyprotocol/test/mocks/token/MockERC721.sol";
 
-import { LicenseNftHolderWhitelistHook } from "../contracts/LicenseNftHolderWhitelistHook.sol";
 import { BaseTest } from "@storyprotocol/periphery/test/utils/BaseTest.t.sol";
 
-// Run this test:
-// forge test --fork-url https://aeneid.storyrpc.io/ --match-path test/LicenseNftHolderWhitelistHook.t.sol
+import {
+    LicenseNftHolderWhitelistHook_ZeroAddress,
+    LicenseNftHolderWhitelistHook_NotAttached,
+    LicenseNftHolderWhitelistHook_InvalidHookData,
+    LicenseNftHolderWhitelistHook_AlreadyWhitelisted,
+    LicenseNftHolderWhitelistHook_NotWhitelisted,
+    LicenseNftHolderWhitelistHook_NotContract,
+    LicenseNftHolderWhitelistHook_NotERC721,
+    LicenseNftHolderWhitelistHook_CallerNotHolder
+} from "../errors/LicenseNftHolderWhitelistHookErrors.sol";
+
+import {LicenseNftHolderWhitelistHook} from "../contracts/LicenseNftHolderWhitelistHook.sol";
+
+/**
+ * Run with Aeneid fork (uses live protocol addresses):
+ *   forge test --fork-url https://aeneid.storyrpc.io/ --match-path test/LicenseNftHolderWhitelistHookTest.t.sol
+ */
 contract LicenseNftHolderWhitelistHookTest is BaseTest {
     address internal alice = address(0xa11ce);
     address internal bob = address(0xb0b);
     address internal charlie = address(0xc4a11e);
-    address internal david = address(0xd4a11e);
 
-    // Core contracts (Aeneid testnet)
+    // Core contracts (Aeneid)
     IIPAssetRegistry internal IP_ASSET_REGISTRY = IIPAssetRegistry(0x77319B4031e6eF1250907aa00018B8B1c67a244b);
     ILicensingModule internal LICENSING_MODULE   = ILicensingModule(0x04fbd8a2e56dd85CFD5500A4A4DfA955B9f1dE6f);
     IPILicenseTemplate internal PIL_TEMPLATE    = IPILicenseTemplate(0x2E896b0b2Fdb7457499B56AAaA4AE55BCB4Cd316);
@@ -42,9 +55,27 @@ contract LicenseNftHolderWhitelistHookTest is BaseTest {
     // License terms
     uint256 public licenseTermsId;
 
-    // Additional mock NFT collections used for gating
+    // Mock NFT collections used for gating
     MockERC721 internal bayc;      // stand-in for BAYC
-    MockERC721 internal mayc;      // second collection to test multi-whitelist
+    MockERC721 internal mayc;      // second collection
+
+    // Re-declare events for expectEmit matching (same signature as contract)
+    event NftContractWhitelisted(
+        bytes32 indexed scopeKey,
+        address licensorIpId,
+        address licenseTemplate,
+        uint256 licenseTermsId,
+        address nftContract,
+        address ipOwnerAtWrite
+    );
+    event NftContractRemovedFromWhitelist(
+        bytes32 indexed scopeKey,
+        address licensorIpId,
+        address licenseTemplate,
+        uint256 licenseTermsId,
+        address nftContract,
+        address ipOwnerAtWrite
+    );
 
     function setUp() public override {
         super.setUp();
@@ -55,7 +86,7 @@ contract LicenseNftHolderWhitelistHookTest is BaseTest {
             LICENSE_REGISTRY
         );
 
-        // Pretend the hook is registered (as in the original sample)
+        // Pretend the hook is registered (mocks ModuleRegistry.isRegistered)
         vm.mockCall(
             MODULE_REGISTRY,
             abi.encodeWithSelector(ModuleRegistry.isRegistered.selector, address(HOOK)),
@@ -80,7 +111,7 @@ contract LicenseNftHolderWhitelistHookTest is BaseTest {
             isSet: true,
             mintingFee: 100,
             licensingHook: address(HOOK),
-            hookData: "",
+            hookData: "", // per-call hookData supplies the NFT; config-level can stay empty
             commercialRevShare: 0,
             disabled: false,
             expectMinimumGroupRewardShare: 0,
@@ -92,24 +123,57 @@ contract LicenseNftHolderWhitelistHookTest is BaseTest {
         LICENSING_MODULE.setLicensingConfig(ipId, address(PIL_TEMPLATE), licenseTermsId, cfg);
         vm.stopPrank();
 
-        // Deploy mock NFT collections to use as whitelist entries
+        // Deploy mock NFT collections
         bayc = new MockERC721("BAYC");
         mayc = new MockERC721("MAYC");
     }
 
     /* ─────────────────────────────────────────────────────────────
-       Whitelist admin (by NFT contract) 
+       Admin: whitelist management (flattened mapping; enriched events)
        ───────────────────────────────────────────────────────────── */
 
-    function test_addWhitelistNft_success() public {
+    function test_addWhitelistNft_emits_enriched_event() public {
+        address ownerAtWrite = mockIpOwner();
+        bytes32 expectedScope = keccak256(abi.encodePacked(ownerAtWrite, ipId, address(PIL_TEMPLATE), licenseTermsId));
+
+        vm.expectEmit(true, true, true, true);
+        emit NftContractWhitelisted(
+            expectedScope,
+            ipId,
+            address(PIL_TEMPLATE),
+            licenseTermsId,
+            address(bayc),
+            ownerAtWrite
+        );
+
         vm.prank(alice);
         HOOK.addWhitelistNft(ipId, address(PIL_TEMPLATE), licenseTermsId, address(bayc));
 
+        // point lookup still available
         assertTrue(HOOK.isNftWhitelisted(ipId, address(PIL_TEMPLATE), licenseTermsId, address(bayc)));
+    }
 
-        address[] memory list = HOOK.listWhitelistedNfts(ipId, address(PIL_TEMPLATE), licenseTermsId);
-        assertEq(list.length, 1);
-        assertEq(list[0], address(bayc));
+    function test_removeWhitelistNft_emits_enriched_event() public {
+        vm.prank(alice);
+        HOOK.addWhitelistNft(ipId, address(PIL_TEMPLATE), licenseTermsId, address(bayc));
+
+        address ownerAtWrite = mockIpOwner();
+        bytes32 expectedScope = keccak256(abi.encodePacked(ownerAtWrite, ipId, address(PIL_TEMPLATE), licenseTermsId));
+
+        vm.expectEmit(true, true, true, true);
+        emit NftContractRemovedFromWhitelist(
+            expectedScope,
+            ipId,
+            address(PIL_TEMPLATE),
+            licenseTermsId,
+            address(bayc),
+            ownerAtWrite
+        );
+
+        vm.prank(alice);
+        HOOK.removeWhitelistNft(ipId, address(PIL_TEMPLATE), licenseTermsId, address(bayc));
+
+        assertFalse(HOOK.isNftWhitelisted(ipId, address(PIL_TEMPLATE), licenseTermsId, address(bayc)));
     }
 
     function test_revert_addWhitelistNft_whenAlreadyWhitelisted() public {
@@ -118,7 +182,7 @@ contract LicenseNftHolderWhitelistHookTest is BaseTest {
 
         vm.expectRevert(
             abi.encodeWithSelector(
-                LicenseNftHolderWhitelistHook.LicenseNftHolderWhitelistHook_AlreadyWhitelisted.selector,
+                LicenseNftHolderWhitelistHook_AlreadyWhitelisted.selector,
                 address(bayc)
             )
         );
@@ -127,27 +191,55 @@ contract LicenseNftHolderWhitelistHookTest is BaseTest {
     }
 
     function test_revert_addWhitelistNft_whenNoPermission() public {
-        vm.expectRevert(); // AccessControlled will revert
+        vm.expectRevert(); // AccessControlled revert
         vm.prank(bob);
         HOOK.addWhitelistNft(ipId, address(PIL_TEMPLATE), licenseTermsId, address(bayc));
     }
 
-    function test_removeWhitelistNft_success() public {
-        vm.startPrank(alice);
-        HOOK.addWhitelistNft(ipId, address(PIL_TEMPLATE), licenseTermsId, address(bayc));
-        HOOK.removeWhitelistNft(ipId, address(PIL_TEMPLATE), licenseTermsId, address(bayc));
-        vm.stopPrank();
+    function test_revert_addWhitelistNft_zeroAddress() public {
+        vm.expectRevert(LicenseNftHolderWhitelistHook_ZeroAddress.selector);
+        vm.prank(alice);
+        HOOK.addWhitelistNft(ipId, address(PIL_TEMPLATE), licenseTermsId, address(0));
+    }
 
-        assertFalse(HOOK.isNftWhitelisted(ipId, address(PIL_TEMPLATE), licenseTermsId, address(bayc)));
+    function test_revert_addWhitelistNft_notAttached() public {
+        // New IP with no license terms attached
+        uint256 otherTokenId = mockNft.mint(alice);
+        address otherIpId = IP_ASSET_REGISTRY.register(block.chainid, address(mockNft), otherTokenId);
 
-        address[] memory list = HOOK.listWhitelistedNfts(ipId, address(PIL_TEMPLATE), licenseTermsId);
-        assertEq(list.length, 0);
+        vm.expectRevert(LicenseNftHolderWhitelistHook_NotAttached.selector);
+        vm.prank(alice);
+        HOOK.addWhitelistNft(otherIpId, address(PIL_TEMPLATE), licenseTermsId, address(bayc));
+    }
+
+    function test_revert_addWhitelistNft_notContract() public {
+        // EOAs have empty code; should revert
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                LicenseNftHolderWhitelistHook_NotContract.selector,
+                bob
+            )
+        );
+        vm.prank(alice);
+        HOOK.addWhitelistNft(ipId, address(PIL_TEMPLATE), licenseTermsId, bob);
+    }
+
+    function test_revert_addWhitelistNft_notERC721() public {
+        // MERC20 is a contract but not ERC721 (no ERC165 support for the 721 interface)
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                LicenseNftHolderWhitelistHook_NotERC721.selector,
+                address(MERC20)
+            )
+        );
+        vm.prank(alice);
+        HOOK.addWhitelistNft(ipId, address(PIL_TEMPLATE), licenseTermsId, address(MERC20));
     }
 
     function test_revert_removeWhitelistNft_whenNotWhitelisted() public {
         vm.expectRevert(
             abi.encodeWithSelector(
-                LicenseNftHolderWhitelistHook.LicenseNftHolderWhitelistHook_NotWhitelisted.selector,
+                LicenseNftHolderWhitelistHook_NotWhitelisted.selector,
                 address(bayc)
             )
         );
@@ -159,7 +251,7 @@ contract LicenseNftHolderWhitelistHookTest is BaseTest {
         vm.prank(alice);
         HOOK.addWhitelistNft(ipId, address(PIL_TEMPLATE), licenseTermsId, address(bayc));
 
-        vm.expectRevert(); // AccessControlled will revert
+        vm.expectRevert(); // AccessControlled revert
         vm.prank(bob);
         HOOK.removeWhitelistNft(ipId, address(PIL_TEMPLATE), licenseTermsId, address(bayc));
     }
@@ -168,37 +260,15 @@ contract LicenseNftHolderWhitelistHookTest is BaseTest {
         assertFalse(HOOK.isNftWhitelisted(ipId, address(PIL_TEMPLATE), licenseTermsId, address(bayc)));
     }
 
-    function test_revert_addWhitelistNft_zeroAddress() public {
-        vm.expectRevert(
-            LicenseNftHolderWhitelistHook.LicenseNftHolderWhitelistHook_ZeroAddress.selector
-        );
-        vm.prank(alice);
-        HOOK.addWhitelistNft(ipId, address(PIL_TEMPLATE), licenseTermsId, address(0));
-    }
-
-    function test_revert_addWhitelistNft_whenLicenseNotAttached() public {
-        // New IP with no license terms attached
-        uint256 otherTokenId = mockNft.mint(alice);
-        address otherIpId = IP_ASSET_REGISTRY.register(block.chainid, address(mockNft), otherTokenId);
-
-        vm.expectRevert(
-            LicenseNftHolderWhitelistHook.LicenseNftHolderWhitelistHook_NotAttached.selector
-        );
-        vm.prank(alice);
-        HOOK.addWhitelistNft(otherIpId, address(PIL_TEMPLATE), licenseTermsId, address(bayc));
-    }
-
     /* ─────────────────────────────────────────────────────────────
-       Gate checks (caller must hold any whitelisted ERC-721) 
+       Gating: candidate NFT must be supplied via hookData and owned by caller
        ───────────────────────────────────────────────────────────── */
 
-    function test_beforeMintLicenseTokens_success_whenCallerHoldsWhitelistedNft() public {
-        // Whitelist BAYC and give bob a BAYC token
+    function test_beforeMint_success_whenCallerHoldsWhitelistedNft() public {
         vm.prank(alice);
         HOOK.addWhitelistNft(ipId, address(PIL_TEMPLATE), licenseTermsId, address(bayc));
         bayc.mint(bob);
 
-        // bob mints; receiver can be anyone (gating is by caller)
         uint256 fee = HOOK.beforeMintLicenseTokens(
             bob,
             ipId,
@@ -206,34 +276,12 @@ contract LicenseNftHolderWhitelistHookTest is BaseTest {
             licenseTermsId,
             1,
             charlie,
-            ""
+            abi.encode(address(bayc))
         );
         assertEq(fee, 100);
     }
 
-    function test_revert_beforeMintLicenseTokens_whenCallerDoesNotHoldAnyWhitelistedNft() public {
-        vm.prank(alice);
-        HOOK.addWhitelistNft(ipId, address(PIL_TEMPLATE), licenseTermsId, address(bayc));
-        // bob does NOT hold BAYC
-
-        vm.expectRevert(
-            abi.encodeWithSelector(
-                LicenseNftHolderWhitelistHook.LicenseNftHolderWhitelistHook_CallerNotHolder.selector,
-                bob
-            )
-        );
-        HOOK.beforeMintLicenseTokens(
-            bob,
-            ipId,
-            address(PIL_TEMPLATE),
-            licenseTermsId,
-            1,
-            bob,
-            ""
-        );
-    }
-
-    function test_beforeMintLicenseTokens_multipleAmount_feeMultiplies() public {
+    function test_beforeMint_multipleAmount_feeMultiplies() public {
         vm.prank(alice);
         HOOK.addWhitelistNft(ipId, address(PIL_TEMPLATE), licenseTermsId, address(bayc));
         bayc.mint(bob);
@@ -245,12 +293,94 @@ contract LicenseNftHolderWhitelistHookTest is BaseTest {
             licenseTermsId,
             5,
             bob,
-            ""
+            abi.encode(address(bayc))
         );
         assertEq(fee, 500); // 5 * 100
     }
 
-    function test_beforeMintLicenseTokens_worksWhenReceiverDiffersFromCaller() public {
+    function test_beforeMint_anyOfMultipleWhitelistedCollections_isEnough_whenProvided() public {
+        vm.startPrank(alice);
+        HOOK.addWhitelistNft(ipId, address(PIL_TEMPLATE), licenseTermsId, address(bayc));
+        HOOK.addWhitelistNft(ipId, address(PIL_TEMPLATE), licenseTermsId, address(mayc));
+        vm.stopPrank();
+
+        mayc.mint(bob);
+
+        // Caller supplies MAYC in hookData; succeeds even without BAYC
+        uint256 fee = HOOK.beforeMintLicenseTokens(
+            bob,
+            ipId,
+            address(PIL_TEMPLATE),
+            licenseTermsId,
+            1,
+            bob,
+            abi.encode(address(mayc))
+        );
+        assertEq(fee, 100);
+    }
+
+    function test_revert_beforeMint_whenCandidateNotOwned() public {
+        vm.prank(alice);
+        HOOK.addWhitelistNft(ipId, address(PIL_TEMPLATE), licenseTermsId, address(bayc));
+        // bob does not own BAYC
+
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                LicenseNftHolderWhitelistHook_CallerNotHolder.selector,
+                bob
+            )
+        );
+        HOOK.beforeMintLicenseTokens(
+            bob,
+            ipId,
+            address(PIL_TEMPLATE),
+            licenseTermsId,
+            1,
+            bob,
+            abi.encode(address(bayc))
+        );
+    }
+
+    function test_revert_beforeMint_whenCandidateNotWhitelisted() public {
+        // bob owns MAYC, but MAYC not whitelisted
+        mayc.mint(bob);
+
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                LicenseNftHolderWhitelistHook_NotWhitelisted.selector,
+                address(mayc)
+            )
+        );
+        HOOK.beforeMintLicenseTokens(
+            bob,
+            ipId,
+            address(PIL_TEMPLATE),
+            licenseTermsId,
+            1,
+            bob,
+            abi.encode(address(mayc))
+        );
+    }
+
+    function test_revert_beforeMint_whenHookDataInvalid() public {
+        vm.prank(alice);
+        HOOK.addWhitelistNft(ipId, address(PIL_TEMPLATE), licenseTermsId, address(bayc));
+        bayc.mint(bob);
+
+        // Empty hookData should revert
+        vm.expectRevert(LicenseNftHolderWhitelistHook_InvalidHookData.selector);
+        HOOK.beforeMintLicenseTokens(
+            bob,
+            ipId,
+            address(PIL_TEMPLATE),
+            licenseTermsId,
+            1,
+            bob,
+            bytes("")
+        );
+    }
+
+    function test_beforeMint_receiverCanDifferFromCaller() public {
         vm.prank(alice);
         HOOK.addWhitelistNft(ipId, address(PIL_TEMPLATE), licenseTermsId, address(bayc));
         bayc.mint(bob);
@@ -261,64 +391,10 @@ contract LicenseNftHolderWhitelistHookTest is BaseTest {
             address(PIL_TEMPLATE),
             licenseTermsId,
             1,
-            alice, // receiver different from caller
-            ""
+            alice, // receiver
+            abi.encode(address(bayc))
         );
         assertEq(fee, 100);
-    }
-
-    function test_beforeMintLicenseTokens_anyOfMultipleWhitelistedCollectionsIsEnough() public {
-        // Whitelist BAYC and MAYC
-        vm.startPrank(alice);
-        HOOK.addWhitelistNft(ipId, address(PIL_TEMPLATE), licenseTermsId, address(bayc));
-        HOOK.addWhitelistNft(ipId, address(PIL_TEMPLATE), licenseTermsId, address(mayc));
-        vm.stopPrank();
-
-        // Give bob only MAYC; no BAYC
-        mayc.mint(bob);
-
-        uint256 fee = HOOK.beforeMintLicenseTokens(
-            bob,
-            ipId,
-            address(PIL_TEMPLATE),
-            licenseTermsId,
-            1,
-            bob,
-            ""
-        );
-        assertEq(fee, 100);
-    }
-
-    function test_whitelistIsolation_acrossDifferentLicenseTerms() public {
-        // Second license terms/config
-        uint256 licenseTermsId2 = PIL_TEMPLATE.registerLicenseTerms(
-            PILFlavors.commercialRemix({
-                mintingFee: 200,
-                commercialRevShare: 0,
-                royaltyPolicy: ROYALTY_POLICY_LAP,
-                currencyToken: address(MERC20)
-            })
-        );
-        Licensing.LicensingConfig memory cfg2 = Licensing.LicensingConfig({
-            isSet: true,
-            mintingFee: 200,
-            licensingHook: address(HOOK),
-            hookData: "",
-            commercialRevShare: 0,
-            disabled: false,
-            expectMinimumGroupRewardShare: 0,
-            expectGroupRewardPool: address(0)
-        });
-
-        vm.startPrank(alice);
-        LICENSING_MODULE.attachLicenseTerms(ipId, address(PIL_TEMPLATE), licenseTermsId2);
-        LICENSING_MODULE.setLicensingConfig(ipId, address(PIL_TEMPLATE), licenseTermsId2, cfg2);
-        // Only whitelist BAYC for first license terms
-        HOOK.addWhitelistNft(ipId, address(PIL_TEMPLATE), licenseTermsId, address(bayc));
-        vm.stopPrank();
-
-        assertTrue(HOOK.isNftWhitelisted(ipId, address(PIL_TEMPLATE), licenseTermsId, address(bayc)));
-        assertFalse(HOOK.isNftWhitelisted(ipId, address(PIL_TEMPLATE), licenseTermsId2, address(bayc)));
     }
 
     function test_calculateMintingFee_matches_beforeMint_fee() public view {
@@ -329,13 +405,13 @@ contract LicenseNftHolderWhitelistHookTest is BaseTest {
             licenseTermsId,
             3,
             bob,
-            ""
+            abi.encode(address(bayc))
         );
         assertEq(preview, 300);
     }
 
     /* ─────────────────────────────────────────────────────────────
-       Derivative registration gating (caller must hold whitelisted NFT)
+       Derivative registration gating (uses same candidate NFT via hookData)
        ───────────────────────────────────────────────────────────── */
 
     function test_beforeRegisterDerivative_success_whenCallerHoldsWhitelistedNft() public {
@@ -343,77 +419,87 @@ contract LicenseNftHolderWhitelistHookTest is BaseTest {
         HOOK.addWhitelistNft(ipId, address(PIL_TEMPLATE), licenseTermsId, address(bayc));
         bayc.mint(bob);
 
-        uint256 fee = 
-            HOOK.beforeRegisterDerivative(
-                bob,
-                address(0), // not used by hook
-                ipId,                 // parent IP (the gated one)
-                address(PIL_TEMPLATE),
-                licenseTermsId,
-                ""
-            );
-        
+        uint256 fee = HOOK.beforeRegisterDerivative(
+            bob,
+            address(0), // childIpId unused
+            ipId,
+            address(PIL_TEMPLATE),
+            licenseTermsId,
+            abi.encode(address(bayc))
+        );
         assertEq(fee, 100);
     }
 
-    function test_revert_beforeRegisterDerivative_whenCallerDoesNotHoldWhitelistedNft() public {
+    function test_revert_beforeRegisterDerivative_whenCandidateNotOwned() public {
         vm.prank(alice);
         HOOK.addWhitelistNft(ipId, address(PIL_TEMPLATE), licenseTermsId, address(bayc));
-        // bob holds nothing
+        // bob does not own BAYC
 
         vm.expectRevert(
             abi.encodeWithSelector(
-                LicenseNftHolderWhitelistHook.LicenseNftHolderWhitelistHook_CallerNotHolder.selector,
+                LicenseNftHolderWhitelistHook_CallerNotHolder.selector,
                 bob
             )
         );
-        
         HOOK.beforeRegisterDerivative(
             bob,
             address(0),
             ipId,
             address(PIL_TEMPLATE),
             licenseTermsId,
-            ""
+            abi.encode(address(bayc))
         );
     }
 
-    // @notice Check that removal uses swap-and-pop correctly,
-    //  This test catches index bookkeeping bugs.
-    function test_removeMaintainsCompactList_swapAndPop() public {
-        vm.startPrank(alice);
-        HOOK.addWhitelistNft(ipId, address(PIL_TEMPLATE), licenseTermsId, address(bayc));
-        HOOK.addWhitelistNft(ipId, address(PIL_TEMPLATE), licenseTermsId, address(mayc));
-        vm.stopPrank();
+    /* ─────────────────────────────────────────────────────────────
+       Ownership change: scope key changes; prior whitelist entries no longer apply
+       ───────────────────────────────────────────────────────────── */
 
-        // Remove first entry
-        vm.prank(alice);
-        HOOK.removeWhitelistNft(ipId, address(PIL_TEMPLATE), licenseTermsId, address(bayc));
-
-        address[] memory list = HOOK.listWhitelistedNfts(ipId, address(PIL_TEMPLATE), licenseTermsId);
-        assertEq(list.length, 1);
-        assertEq(list[0], address(mayc));
-        assertFalse(HOOK.isNftWhitelisted(ipId, address(PIL_TEMPLATE), licenseTermsId, address(bayc)));
-        assertTrue(HOOK.isNftWhitelisted(ipId, address(PIL_TEMPLATE), licenseTermsId, address(mayc)));
-    }
-
-    // @notice This test ensures gating re-engages as expected and 
-    //  removing the last whitelist entry blocks minting,
-    function test_afterRemovingLastWhitelist_mintReverts() public {
+    function test_scopeResets_onIpOwnershipTransfer() public {
+        // Whitelist BAYC under Alice's ownership and give bob BAYC
         vm.prank(alice);
         HOOK.addWhitelistNft(ipId, address(PIL_TEMPLATE), licenseTermsId, address(bayc));
         bayc.mint(bob);
 
-        // Works before removal
-        HOOK.beforeMintLicenseTokens(bob, ipId, address(PIL_TEMPLATE), licenseTermsId, 1, bob, "");
+        // Works while Alice owns the IP
+        HOOK.beforeMintLicenseTokens(
+            bob, ipId, address(PIL_TEMPLATE), licenseTermsId, 1, bob, abi.encode(address(bayc))
+        );
 
-        // Remove and expect revert
+        // Transfer underlying IP NFT to bob (owner changes -> scope key changes)
         vm.prank(alice);
-        HOOK.removeWhitelistNft(ipId, address(PIL_TEMPLATE), licenseTermsId, address(bayc));
-        vm.expectRevert(abi.encodeWithSelector(
-            LicenseNftHolderWhitelistHook.LicenseNftHolderWhitelistHook_CallerNotHolder.selector, bob
-        ));
-        HOOK.beforeMintLicenseTokens(bob, ipId, address(PIL_TEMPLATE), licenseTermsId, 1, bob, "");
+        mockNft.transferFrom(alice, bob, tokenId);
+
+        // Old whitelist entry should no longer apply (now not whitelisted under new owner)
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                LicenseNftHolderWhitelistHook_NotWhitelisted.selector,
+                address(bayc)
+            )
+        );
+        HOOK.beforeMintLicenseTokens(
+            bob, ipId, address(PIL_TEMPLATE), licenseTermsId, 1, bob, abi.encode(address(bayc))
+        );
+
+        // New owner can re-whitelist and proceed
+        vm.prank(bob);
+        HOOK.addWhitelistNft(ipId, address(PIL_TEMPLATE), licenseTermsId, address(bayc));
+        HOOK.beforeMintLicenseTokens(
+            bob, ipId, address(PIL_TEMPLATE), licenseTermsId, 1, bob, abi.encode(address(bayc))
+        );
     }
 
+    /* ─────────────────────────────────────────────────────────────
+       Helpers
+       ───────────────────────────────────────────────────────────── */
+
+    function mockIpOwner() internal view returns (address) {
+        // IIPAccount(payable(ipId)).owner() would also work, but we know alice owns at setUp time
+        // Read via the same logic the hook uses to avoid surprises
+        // solhint-disable-next-line avoid-low-level-calls
+        (bool ok, bytes memory data) =
+                            ipId.staticcall(abi.encodeWithSignature("owner()"));
+        require(ok && data.length == 32, "owner() failed");
+        return abi.decode(data, (address));
+    }
 }
